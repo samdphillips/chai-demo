@@ -5,6 +5,9 @@
          racket/set
          (only-in racket/math nonnegative-integer?))
 
+(module+ test
+  (require rackunit))
+
 (define (warning who msg . vals)
   (eprintf "~a: ~a~%" who (apply format msg vals)))
 
@@ -28,6 +31,16 @@
     [(or '+ 'add1 'sub1) 1]
     [(or 'quotient/remainder) 2]
     [_ '*]))
+
+(define (merge-arities a1 a2)
+  (match* (a1 a2)
+    ;; normally `merge-arities` is called after simple eqv unification has
+    ;; failed so this first clause is only for the general case.
+    [(_ (== a1)) a1]
+    [((? nonnegative-integer?) (? nonnegative-integer?)) #f]
+    [('* '*) '*]
+    [('* n) (merge-arities a2 a1)]
+    [(n _)  n]))
 
 (define (floe-lvars floe)
   (match floe
@@ -124,6 +137,10 @@
   (let* ([cst* (add-decl-constraints cst* i ai)]
          [cst* (add-decl-constraints cst* o ao)])
     (match rator
+      ['ground
+       (add-constraints cst*
+                        `(has-arity ,i *)
+                        `(has-arity ,o 0))]
       ['gen
        (add-constraints cst*
                         `(has-arity ,i *)
@@ -138,6 +155,13 @@
        (generate-fine-template-constraints cst* i o (car rands))]
       )))
 
+(define (update-subst subst var tgt)
+  (unless (var? var)
+    (error 'update-subst
+           "lhs of update not a var: ~a"
+           var))
+  (hash-set subst var tgt))
+
 (define (resolve subst v)
   (cond
     [(arity? v) v]
@@ -146,6 +170,16 @@
        [#f v]
        [(? arity? a) a]
        [v^ (resolve subst v^)])]))
+
+(define (canon-var subst v)
+  (cond
+    [(arity? v) #f]
+    [else
+     (let do-resolve ([v v])
+       (match (hash-ref subst v #f)
+         [#f v]
+         [(? arity?) v]
+         [v^ (do-resolve v^)]))]))
 
 (define (resolve* subst v*)
   (for/list ([v (in-list v*)])
@@ -159,13 +193,18 @@
      (define u^ (resolve subst u))
      (define v^ (resolve subst v))
      (values (cond
-               [(eqv? u^ v^) subst]
-               [(var? u^) (hash-set subst u^ v^)]
-               [(var? v^) (hash-set subst v^ u^)]
-               ;; XXX: the following two may be incorrect, may need to walk
-               ;; the subst to a variable and then replace that value.
-               [(eq? '* u^) (hash-set subst u v^)]
-               [(eq? '* v^) (hash-set subst v u^)]
+               [(eqv? #R u^ #R v^) subst]
+               [(var? u^) (update-subst subst u^ v^)]
+               [(var? v^) (update-subst subst v^ u^)]
+               [(merge-arities u^ v^)
+                => (λ (new-arity)
+                     (define cu (canon-var subst u))
+                     (define cv (canon-var subst v))
+                     (define subst^
+                       (if cv
+                           (update-subst subst cv cu)
+                           subst))
+                     (update-subst subst^ cu new-arity))]
                [else
                 (error 'apply-constraint
                        "cannot apply constraint: ~a == ~a"
@@ -190,9 +229,23 @@
        [(zero? n)
         (values subst (defer `(arity-sum ,s ,@v^^*)))]
        [else
-        (values subst (defer `(arity-sum ,s ,n ,@v^^*)))])
-     ]
-    ))
+        (values subst (defer `(arity-sum ,s ,n ,@v^^*)))])]))
+
+(module+ test
+  (check-equal?
+   (call-with-values
+    (λ () (apply-constraint (hasheq 'a 1) (set) '(has-arity a *)))
+    list)
+   (list (hasheq 'a 1) (set)))
+
+
+  (check-equal?
+   (call-with-values
+    (λ () (apply-constraint (hasheq 'a 'b 'b 1) (set) '(has-arity a *)))
+    list)
+   (list (hasheq 'a 'b 'b 1) (set)))
+
+  )
 
 (define (solve-constraints cst*)
   (let do-solve ([subst (hasheq)]
@@ -235,7 +288,6 @@
   (define subst #R(solve-constraints cst*))
   (annotate-arity subst floe^))
 
-
 #;
 (compile '(thread))
 
@@ -265,3 +317,12 @@
 #;
 (compile '(relay (tee (thread) (thread))
                  (tee (thread) (thread))))
+
+#;
+(compile '(ground))
+
+#;
+(compile '(thread (ground) (gen 2)))
+
+#;
+(compile '(thread (#%fine-template (add1 _)) (ground) (gen 2)))
