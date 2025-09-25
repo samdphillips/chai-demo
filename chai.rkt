@@ -12,7 +12,10 @@
   (eprintf "~a: ~a~%" who (apply format msg vals)))
 
 (define (arity? v)
-  (match v [(or '* (? nonnegative-integer?)) #t] [_ #f]))
+  (match v
+    [(or (? nonnegative-integer?)
+         (list '>= (? nonnegative-integer?))) #t]
+    [_ #f]))
 
 (define (check-arity who v)
   (unless (arity? v)
@@ -30,17 +33,34 @@
   (match rator
     [(or '+ 'add1 'sub1) 1]
     [(or 'quotient/remainder) 2]
-    [_ '*]))
+    [_ '(>= 0)]))
 
-(define (merge-arities a1 a2)
-  (match* (a1 a2)
+(define (merge-arities a b)
+  (match* (a b)
     ;; normally `merge-arities` is called after simple eqv unification has
     ;; failed so this first clause is only for the general case.
-    [(_ (== a1)) a1]
+    [(_ (== a)) a]
     [((? nonnegative-integer?) (? nonnegative-integer?)) #f]
-    [('* '*) '*]
-    [('* n) (merge-arities a2 a1)]
-    [(n _)  n]))
+    [((list '>= m) (list '>= n)) `(>= ,(max m n))]
+    [((? nonnegative-integer?) _) (merge-arities b a)]
+    [((list '>= m) n) (and (>= n m) n)]))
+
+(module+ test
+  (check-equal? (merge-arities 0 0) 0)
+  (check-equal? (merge-arities 3 3) 3)
+  (check-equal? (merge-arities '(>= 0) '(>= 0)) '(>= 0))
+  (check-equal? (merge-arities '(>= 0) 3) 3)
+  (check-equal? (merge-arities 3 '(>= 0)) 3)
+  (check-equal? (merge-arities '(>= 3) 3) 3)
+  (check-equal? (merge-arities 3 '(>= 3)) 3)
+  (check-equal? (merge-arities '(>= 2) 3) 3)
+  (check-equal? (merge-arities 3 '(>= 2)) 3)
+  (check-equal? (merge-arities '(>= 2) '(>= 3)) '(>= 3))
+  (check-equal? (merge-arities '(>= 3) '(>= 2)) '(>= 3))
+
+  (check-false (merge-arities 0 3))
+  (check-false (merge-arities '(>= 3) 2))
+  (check-false (merge-arities 2 '(>= 3))))
 
 (define (floe-lvars floe)
   (match floe
@@ -132,18 +152,17 @@
   (define (add-decl-constraints cst* var arity)
     (match arity
       [#f cst*]
-      ;['* cst*]
       [n  (add-constraint cst* `(has-arity ,var ,n))]))
   (let* ([cst* (add-decl-constraints cst* i ai)]
          [cst* (add-decl-constraints cst* o ao)])
     (match rator
       ['ground
        (add-constraints cst*
-                        `(has-arity ,i *)
+                        `(has-arity ,i (>= 0))
                         `(has-arity ,o 0))]
       ['gen
        (add-constraints cst*
-                        `(has-arity ,i *)
+                        `(has-arity ,i (>= 0))
                         `(has-arity ,o ,(length rands)))]
       ['thread
        (generate-thread-constraints cst* i o rands)]
@@ -207,7 +226,7 @@
                      (update-subst subst^ cu new-arity))]
                [else
                 (error 'apply-constraint
-                       "cannot apply constraint: ~a == ~a"
+                       "cannot apply constraint: (has-arity ~a ~a)"
                        u^ v^)])
              defer-cst*)]
     [`(arity-sum ,s . ,v*)
@@ -234,14 +253,13 @@
 (module+ test
   (check-equal?
    (call-with-values
-    (λ () (apply-constraint (hasheq 'a 1) (set) '(has-arity a *)))
+    (λ () (apply-constraint (hasheq 'a 1) (set) '(has-arity a (>= 0))))
     list)
    (list (hasheq 'a 1) (set)))
 
-
   (check-equal?
    (call-with-values
-    (λ () (apply-constraint (hasheq 'a 'b 'b 1) (set) '(has-arity a *)))
+    (λ () (apply-constraint (hasheq 'a 'b 'b 1) (set) '(has-arity a (>= 0))))
     list)
    (list (hasheq 'a 'b 'b 1) (set)))
 
@@ -272,7 +290,7 @@
     (match (resolve subst var)
       [(? arity? a) a]
       [_ (warning 'annotate-arity "no arity computed for ~a" var)
-         '*]))
+         '(>= 0)]))
   (define ai (resolve-arity subst fi))
   (define ao (resolve-arity subst fo))
   (define annot `((,fi ,ai) (,fo ,ao)))
