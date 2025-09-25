@@ -69,25 +69,24 @@
 
 (define (add-vars* floe*) (map add-vars floe*))
 
-;; XXX: rator/rands, expr/floe
-(define (add-vars expr)
-  (define-values (op arity rest)
-    (match expr
-      [`(,op ,(? arity-decl? arity) . ,rest)
-       (values op arity rest)]
-      [`(,op . ,rest)
-       (values op #f rest)]))
-  (define i (gensym (~a op "-in")))
-  (define o (gensym (~a op "-out")))
+(define (add-vars floe)
+  (define-values (rator arity rands)
+    (match floe
+      [`(,rator ,(? arity-decl? arity) . ,rands)
+       (values rator arity rands)]
+      [`(,rator . ,rands)
+       (values rator #f rands)]))
+  (define i (gensym (~a rator "-in")))
+  (define o (gensym (~a rator "-out")))
   (define names
     (if arity
         (list (list i (car arity))
               (list o (cadr arity)))
         (list i o)))
-  (match op
+  (match rator
     [(or 'thread 'tee 'relay)
-     `(,op ,names ,@(add-vars* rest))]
-    [_ `(,op ,names ,@rest)]))
+     `(,rator ,names ,@(add-vars* rands))]
+    [_ `(,rator ,names ,@rands)]))
 
 (define (simplify-constraint cst)
   (match cst
