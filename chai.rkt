@@ -163,6 +163,14 @@
        (add-constraints cst*
                         `(has-arity ,i (>= 0))
                         `(has-arity ,o ,(length rands)))]
+      ['select
+       (add-constraints cst*
+                        `(has-arity ,i (>= ,(apply max rands)))
+                        `(has-arity ,o ,(length rands)))]
+      ['esc
+       (add-constraints cst*
+                        `(has-arity ,i (>= 0))
+                        `(has-arity ,o (>= 0)))]
       ['thread
        (generate-thread-constraints cst* i o rands)]
       ['tee
@@ -300,10 +308,11 @@
     [_ `(,rator ,annot ,@rands)]))
 
 (define (compile floe)
-  (define floe^ #R(add-vars floe))
+  (define floe^ #R(add-vars #R floe))
   (define cst* #R(generate-constraints (set) floe^))
   (define subst #R(solve-constraints cst*))
   (annotate-arity subst floe^))
+
 
 #;
 (compile '(thread))
