@@ -1,6 +1,7 @@
 #lang debug racket/base
 
 (require racket/format
+         racket/list
          racket/match
          racket/set
          (only-in racket/math nonnegative-integer?))
@@ -31,7 +32,7 @@
 
 (define (known-return-arity rator)
   (match rator
-    [(or '+ 'add1 'sub1) 1]
+    [(or '+ '- '* '/ 'add1 'sub1) 1]
     [(or 'quotient/remainder) 2]
     [_ '(>= 0)]))
 
@@ -62,14 +63,52 @@
   (check-false (merge-arities '(>= 3) 2))
   (check-false (merge-arities 2 '(>= 3))))
 
+(define (floe-infos floe)
+  (match floe
+    [`(,_ (,in ,out) . ,_) (values in out)]))
+
+(define (floe-in floe)
+  (match floe
+    [`(,_ (,in ,_) . ,_) in]))
+
+(define (floe-out floe)
+  (match floe
+    [`(,_ (,_ ,out) . ,_) out]))
+
+(define (info-lvar info) (car info))
+(define (info-arity info) (cadr info))
+(define (info-vars info) (caddr info))
+
 (define (floe-lvars floe)
   (match floe
     [`(,_ (,(? symbol? i) ,(? symbol? o)) . ,_) (values i o)]
-    [`(,_ ((,(? symbol? i) ,_) (,(? symbol? o) ,_)) . ,_) (values i o)]))
+    [`(,_ ((,(? symbol? i) . ,_) (,(? symbol? o) . ,_)) . ,_) (values i o)]))
 
-(define (add-vars* floe*) (map add-vars floe*))
+(define (floe-arities floe)
+  (match floe
+    [`(,_ ((,(? symbol?) ,(? arity? ai) . ,_)
+           (,(? symbol?) ,(? arity? ao) . ,_))
+          . ,_)
+     (values ai ao)]))
 
-(define (add-vars floe)
+(define (floe-vars floe)
+  (match floe
+    [`(,_ ((,(? symbol?) ,(? arity?) ,ivars)
+           (,(? symbol?) ,(? arity?) ,ovars))
+          . ,_)
+     (values ivars ovars)]))
+
+(define (floe-ivars floe)
+  (call-with-values (λ () (floe-vars floe))
+                    (λ (in out) in)))
+
+(define (floe-ovars floe)
+  (call-with-values (λ () (floe-vars floe))
+                    (λ (in out) out)))
+
+(define (add-lvars* floe*) (map add-lvars floe*))
+
+(define (add-lvars floe)
   (define-values (rator arity rands)
     (match floe
       [`(,rator ,(? arity-decl? arity) . ,rands)
@@ -85,7 +124,7 @@
         (list i o)))
   (match rator
     [(or 'thread 'tee 'relay)
-     `(,rator ,names ,@(add-vars* rands))]
+     `(,rator ,names ,@(add-lvars* rands))]
     [_ `(,rator ,names ,@rands)]))
 
 (define (simplify-constraint cst)
@@ -214,12 +253,12 @@
 (define (apply-constraint subst defer-cst* cst)
   (define (defer cst)
     (set-add defer-cst* cst))
-  (match #R cst
+  (match cst
     [`(has-arity ,u ,v)
      (define u^ (resolve subst u))
      (define v^ (resolve subst v))
      (values (cond
-               [(eqv? #R u^ #R v^) subst]
+               [(eqv? u^ v^) subst]
                [(var? u^) (update-subst subst u^ v^)]
                [(var? v^) (update-subst subst v^ u^)]
                [(merge-arities u^ v^)
@@ -277,7 +316,7 @@
                  [cst* cst*])
     (define-values (subst^ cst^*)
       (for/fold ([subst subst] [defer-cst* (set)]) ([cst (in-set cst*)])
-        #R (apply-constraint subst defer-cst* cst)))
+        (apply-constraint subst defer-cst* cst)))
     (cond
       [(set-empty? cst^*) subst^]
       [(equal? cst* cst^*)
@@ -307,11 +346,79 @@
      `(,rator ,annot ,@(annotate-arity* subst rands))]
     [_ `(,rator ,annot ,@rands)]))
 
+(define (generate-vars base-name arity)
+  (match arity
+    [(? nonnegative-integer?)
+     (for/list ([i (in-range arity)])
+       (string->symbol (~a base-name "." i)))]))
+
+(define (add-vars floe)
+  (define-values (fi fo) (floe-lvars floe))
+  (define-values (ai ao) (floe-arities floe))
+  (define ivars (generate-vars fi ai))
+  (define ovars (generate-vars fo ao))
+  (define annot `((,fi ,ai ,ivars) (,fo ,ao ,ovars)))
+  (match-define `(,rator ,_ . ,rands) floe)
+  (match rator
+    [(or 'thread 'tee 'relay)
+     `(,rator ,annot ,@(map add-vars rands))]
+    [_ `(,rator ,annot ,@rands)]))
+
+(define (merge-floe-info select-info floe*)
+  (for/fold ([arity 0]
+             [v null]
+             #:result `(#f ,arity ,v))
+            ([floe (in-list floe*)])
+    (define info (select-info floe))
+    (values (+ arity (info-arity info))
+            (append v (info-vars info)))))
+
+(define (extract-routing-tee conne in-info out-info floe*)
+  (define conne^
+    (for/fold ([conne conne]) ([floe (in-list floe*)])
+      (define conne^ (extract-routing conne floe))
+      (cons `(connect ,in-info ,(floe-in floe)) conne^)))
+  (cons `(connect ,(merge-floe-info floe-out floe*) ,out-info)
+        conne^))
+
+(define (extract-routing-relay conne in-info out-info floe*)
+  (list* `(connect ,in-info ,(merge-floe-info floe-in floe*))
+         `(connect ,(merge-floe-info floe-out floe*) ,out-info)
+         (extract-routing* conne floe*)))
+
+(define (extract-routing-thread conne in-info out-info floe*)
+  (define-values (final-o conne^)
+    (for/fold ([last-o in-info] [conne conne]) ([floe (in-list floe*)])
+      (define-values (fin fout) (floe-infos floe))
+      (define conne^ (extract-routing conne floe))
+      (values fout
+              (cons `(connect ,last-o ,fin) conne^))))
+  (cons `(connect ,final-o ,out-info) conne^))
+
+(define (extract-routing* conne floe*)
+  (for/fold ([conne conne]) ([floe (in-list floe*)])
+    (extract-routing conne floe)))
+
+(define (extract-routing conne floe)
+  (match floe
+    [`(tee (,in-info ,out-info) . ,rands)
+     (extract-routing-tee conne in-info out-info rands)]
+    [`(thread (,in-info ,out-info) . ,rands)
+     (extract-routing-thread conne in-info out-info rands)]
+    [`(relay (,in-info ,out-info) . ,rands)
+     (extract-routing-relay conne in-info out-info rands)]
+    [(list* (or '#%fine-template) _) (cons floe conne)]))
+
 (define (compile floe)
-  (define floe^ #R(add-vars #R floe))
+  (define floe^ #R(add-lvars #R floe))
   (define cst* #R(generate-constraints (set) floe^))
   (define subst #R(solve-constraints cst*))
-  (annotate-arity subst floe^))
+  (define floe-arity #R(annotate-arity subst floe^))
+  (define floe-arity^ #R(add-vars floe-arity))
+  (values
+   (floe-ivars floe-arity^)
+   (floe-ovars floe-arity^)
+   (extract-routing null floe-arity^)))
 
 
 #;
@@ -352,3 +459,6 @@
 
 #;
 (compile '(thread (#%fine-template (add1 _)) (ground) (gen 2)))
+
+#;
+(compile '(relay (esc #f) (esc #f)))
