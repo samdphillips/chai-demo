@@ -1,10 +1,11 @@
 #lang debug racket/base
 
-(require racket/format
+(require graph
+         racket/format
          racket/list
          racket/match
-         racket/set
-         (only-in racket/math nonnegative-integer?))
+         (only-in racket/math nonnegative-integer?)
+         racket/set)
 
 (module+ test
   (require rackunit))
@@ -68,43 +69,33 @@
     [`(,_ (,in ,out) . ,_) (values in out)]))
 
 (define (floe-in floe)
-  (match floe
-    [`(,_ (,in ,_) . ,_) in]))
+  (define-values (in out) (floe-infos floe))
+  in)
 
 (define (floe-out floe)
-  (match floe
-    [`(,_ (,_ ,out) . ,_) out]))
+  (define-values (in out) (floe-infos floe))
+  out)
 
-(define (info-lvar info) (car info))
-(define (info-arity info) (cadr info))
-(define (info-vars info) (caddr info))
+(define (info-lvar info)
+  (match info
+    [(list* (? symbol? v) _) v]
+    [(? symbol? v) v]))
+(define (info-arity info)
+  (match info
+    [(list* _ a _) a]
+    [_ #f]))
+(define (info-vars info)
+  (match info
+    [(list _ _ v*) v*]
+    [_ #f]))
 
-(define (floe-lvars floe)
-  (match floe
-    [`(,_ (,(? symbol? i) ,(? symbol? o)) . ,_) (values i o)]
-    [`(,_ ((,(? symbol? i) . ,_) (,(? symbol? o) . ,_)) . ,_) (values i o)]))
+(define ((make-floe-accessor ref) floe)
+  (define-values (in out) (floe-infos floe))
+  (values (ref in) (ref out)))
 
-(define (floe-arities floe)
-  (match floe
-    [`(,_ ((,(? symbol?) ,(? arity? ai) . ,_)
-           (,(? symbol?) ,(? arity? ao) . ,_))
-          . ,_)
-     (values ai ao)]))
-
-(define (floe-vars floe)
-  (match floe
-    [`(,_ ((,(? symbol?) ,(? arity?) ,ivars)
-           (,(? symbol?) ,(? arity?) ,ovars))
-          . ,_)
-     (values ivars ovars)]))
-
-(define (floe-ivars floe)
-  (call-with-values (λ () (floe-vars floe))
-                    (λ (in out) in)))
-
-(define (floe-ovars floe)
-  (call-with-values (λ () (floe-vars floe))
-                    (λ (in out) out)))
+(define floe-lvars (make-floe-accessor info-lvar))
+(define floe-arities (make-floe-accessor info-arity))
+(define floe-vars (make-floe-accessor info-vars))
 
 (define (add-lvars* floe*) (map add-lvars floe*))
 
@@ -377,13 +368,13 @@
   (define conne^
     (for/fold ([conne conne]) ([floe (in-list floe*)])
       (define conne^ (extract-routing conne floe))
-      (cons `(connect ,in-info ,(floe-in floe)) conne^)))
-  (cons `(connect ,(merge-floe-info floe-out floe*) ,out-info)
+      (cons `(connect (,in-info ,(floe-in floe))) conne^)))
+  (cons `(connect (,(merge-floe-info floe-out floe*) ,out-info))
         conne^))
 
 (define (extract-routing-relay conne in-info out-info floe*)
-  (list* `(connect ,in-info ,(merge-floe-info floe-in floe*))
-         `(connect ,(merge-floe-info floe-out floe*) ,out-info)
+  (list* `(connect (,in-info ,(merge-floe-info floe-in floe*)))
+         `(connect (,(merge-floe-info floe-out floe*) ,out-info))
          (extract-routing* conne floe*)))
 
 (define (extract-routing-thread conne in-info out-info floe*)
@@ -392,8 +383,8 @@
       (define-values (fin fout) (floe-infos floe))
       (define conne^ (extract-routing conne floe))
       (values fout
-              (cons `(connect ,last-o ,fin) conne^))))
-  (cons `(connect ,final-o ,out-info) conne^))
+              (cons `(connect (,last-o ,fin)) conne^))))
+  (cons `(connect (,final-o ,out-info)) conne^))
 
 (define (extract-routing* conne floe*)
   (for/fold ([conne conne]) ([floe (in-list floe*)])
@@ -409,17 +400,84 @@
      (extract-routing-relay conne in-info out-info rands)]
     [(list* (or '#%fine-template) _) (cons floe conne)]))
 
+(define (edge-map conne)
+  (for/fold ([dest (hasheq)] [src (hasheq)]) ([floe (in-list conne)])
+    (define (update t f v*)
+      (for/fold ([t t]) ([v (in-list v*)])
+        (hash-update t v f (λ () null))))
+    (define-values (iv ov) (floe-vars floe))
+    (values (update dest
+                    (λ (vs) (cons floe vs))
+                    iv)
+            (update src
+                    (λ (vs)
+                      (unless (null? vs)
+                        (error 'edge-map "too many sources"))
+                      floe)
+                    ov))))
+
+(define (order-conne conne)
+  (define-values (dest src) (edge-map conne))
+  (define edge-labels
+    (set-union (list->seteq (hash-keys src))
+               (list->seteq (hash-keys dest))))
+  (define edges
+    (for*/list ([e (in-set edge-labels)]
+                [s (in-value (hash-ref src e #f))]
+                #:when s
+                [d (in-list (hash-ref dest e null))])
+      (list s d)))
+  (tsort (unweighted-graph/directed edges)))
+
+(define (conne:codegen/fine-template in out expr tail)
+  (define expr^
+    (let replace ([expr expr]
+                  [ivar* (info-vars in)])
+      (cond
+        [(null? expr) null]
+        [(eq? '_ (car expr))
+         (cons (car ivar*)
+               (replace (cdr expr) (cdr ivar*)))]
+        [else
+         (cons (car expr)
+               (replace (cdr expr) ivar*))])))
+  `(let-values ([,(info-vars out) ,expr^]) ,tail))
+
+(define (conne:codegen/tail conne* tail)
+  (cond
+    [(null? conne*) tail]
+    [else
+     (define tail^
+       (match (car conne*)
+         [`(connect (,in ,out))
+          `(let-values ([,(info-vars out) (values . ,(info-vars in))])
+             ,tail)]
+         [`(#%fine-template (,in ,out) ,expr)
+          (conne:codegen/fine-template in out expr tail)]))
+     (conne:codegen/tail (cdr conne*) tail^)]))
+
+(define (conne:codegen in out conne*)
+  (define tail
+    (conne:codegen/tail (reverse conne*)
+                        `(values . ,(info-vars out))))
+  `(lambda ,(info-vars in) ,tail))
+
 (define (compile floe)
   (define floe^ #R(add-lvars #R floe))
   (define cst* #R(generate-constraints (set) floe^))
   (define subst #R(solve-constraints cst*))
   (define floe-arity #R(annotate-arity subst floe^))
   (define floe-arity^ #R(add-vars floe-arity))
-  (values
-   (floe-ivars floe-arity^)
-   (floe-ovars floe-arity^)
-   (extract-routing null floe-arity^)))
+  (define conne #R (extract-routing null floe-arity^))
+  (define conne^ #R (order-conne conne))
+  (conne:codegen (floe-in floe-arity^)
+                 (floe-out floe-arity^)
+                 conne^))
 
+#;
+(compile
+ '(thread (relay (#%fine-template (add1 _)) (#%fine-template (sub1 _)))
+          (tee (thread) (thread))))
 
 #;
 (compile '(thread))
@@ -443,6 +501,10 @@
 #;
 (compile '(tee (#%fine-template (quotient/remainder _ _))
                (#%fine-template (* _ _))))
+
+#;
+(compile '(thread (#%fine-template (quotient/remainder _ _))
+                  (#%fine-template (* _ _))))
 
 #;
 (compile '(relay (thread) (thread) (thread)))
