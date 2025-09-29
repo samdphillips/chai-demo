@@ -404,7 +404,13 @@
   (match arity
     [(? nonnegative-integer?)
      (for/list ([i (in-range arity)])
-       (string->symbol (~a base-name "." i)))]))
+       (string->symbol (~a base-name "." i)))]
+    [`(>= ,n)
+     (define rest
+       (string->symbol (~a base-name "*")))
+     (for/fold ([v* (list rest)])
+               ([v (in-list (reverse (generate-vars base-name n)))])
+       (cons v v*))]))
 
 (define (add-vars floe)
   (define-values (fi fo) (floe-lvars floe))
@@ -455,13 +461,14 @@
 
 (define (extract-routing conne floe)
   (match floe
+    [`(ground ,info) conne]
     [`(tee (,in-info ,out-info) . ,rands)
      (extract-routing-tee conne in-info out-info rands)]
     [`(thread (,in-info ,out-info) . ,rands)
      (extract-routing-thread conne in-info out-info rands)]
     [`(relay (,in-info ,out-info) . ,rands)
      (extract-routing-relay conne in-info out-info rands)]
-    [(list* (or '#%fine-template) _) (cons floe conne)]))
+    [(list* (or '#%fine-template 'gen 'esc) _) (cons floe conne)]))
 
 (define (edge-map conne)
   (for/fold ([dest (hasheq)] [src (hasheq)]) ([floe (in-list conne)])
@@ -492,6 +499,14 @@
       (list s d)))
   (tsort (unweighted-graph/directed edges)))
 
+(define (build-args nfo)
+  (match (info-arity nfo)
+    [(? nonnegative-integer?) (info-vars nfo)]
+    [`(>= ,_)
+     (define v* (reverse (info-vars nfo)))
+     (for/fold ([nv* (car v*)]) ([v (in-list (cdr v*))])
+       (cons v nv*))]))
+
 (define (conne:codegen/fine-template in out expr tail)
   (define expr^
     (let replace ([expr expr]
@@ -506,6 +521,21 @@
                (replace (cdr expr) ivar*))])))
   `(let-values ([,(info-vars out) ,expr^]) ,tail))
 
+(define (conne:codegen/esc in out expr tail)
+  (define (do-call c)
+    (match (info-arity in)
+      [(? nonnegative-integer?) c]
+      [`(>= ,_) `(apply . ,c)]))
+  (define call
+    (do-call `(,expr . ,(info-vars in))))
+  (match (info-arity out)
+    [(? nonnegative-integer?)
+     `(let-values ([,(info-vars out) ,call]) ,tail)]
+    [`(>= ,_)
+     `(call-with-values
+       (lambda () ,call)
+       (lambda ,(build-args out) ,tail))]))
+
 (define (conne:codegen/tail conne* tail)
   (cond
     [(null? conne*) tail]
@@ -513,17 +543,23 @@
      (define tail^
        (match (car conne*)
          [`(connect (,in ,out))
+          ;; XXX: need to handle varying connects
           `(let-values ([,(info-vars out) (values . ,(info-vars in))])
              ,tail)]
          [`(#%fine-template (,in ,out) ,expr)
-          (conne:codegen/fine-template in out expr tail)]))
+          (conne:codegen/fine-template in out expr tail)]
+         [`(esc (,in ,out) ,expr)
+          (conne:codegen/esc in out expr tail)]
+         [`(gen (,_ ,out) ,@vals)
+          `(let-values ([,(info-vars out) (values . ,vals)])
+             ,tail)]))
      (conne:codegen/tail (cdr conne*) tail^)]))
 
 (define (conne:codegen in out conne*)
   (define tail
     (conne:codegen/tail (reverse conne*)
                         `(values . ,(info-vars out))))
-  `(lambda ,(info-vars in) ,tail))
+  `(lambda ,(build-args in) ,tail))
 
 (define (compile floe)
   (define floe^ #R(add-lvars #R floe))
