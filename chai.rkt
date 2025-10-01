@@ -185,6 +185,10 @@
   (let* ([cst* (add-decl-constraints cst* i ai)]
          [cst* (add-decl-constraints cst* o ao)])
     (match rator
+      ['as
+       (add-constraints cst*
+                        `(has-arity ,i ,(length rands))
+                        `(has-arity ,o 0))]
       ['ground
        (add-constraints cst*
                         `(has-arity ,i (>= 0))
@@ -195,7 +199,7 @@
                         `(has-arity ,o ,(length rands)))]
       ['select
        (add-constraints cst*
-                        `(has-arity ,i (>= ,(apply max rands)))
+                        `(has-arity ,i (>= ,(sub1 (apply max rands))))
                         `(has-arity ,o ,(length rands)))]
       ['esc
        (add-constraints cst*
@@ -433,7 +437,7 @@
     (values (+ arity (info-arity info))
             (append v (info-vars info)))))
 
-(define (extract-routing-tee conne in-info out-info floe*)
+(define (extract-routing/tee conne in-info out-info floe*)
   (define conne^
     (for/fold ([conne conne]) ([floe (in-list floe*)])
       (define conne^ (extract-routing conne floe))
@@ -441,12 +445,12 @@
   (cons `(connect (,(merge-floe-info floe-out floe*) ,out-info))
         conne^))
 
-(define (extract-routing-relay conne in-info out-info floe*)
+(define (extract-routing/relay conne in-info out-info floe*)
   (list* `(connect (,in-info ,(merge-floe-info floe-in floe*)))
          `(connect (,(merge-floe-info floe-out floe*) ,out-info))
          (extract-routing* conne floe*)))
 
-(define (extract-routing-thread conne in-info out-info floe*)
+(define (extract-routing/thread conne in-info out-info floe*)
   (define-values (final-o conne^)
     (for/fold ([last-o in-info] [conne conne]) ([floe (in-list floe*)])
       (define-values (fin fout) (floe-infos floe))
@@ -460,14 +464,24 @@
     (extract-routing conne floe)))
 
 (define (extract-routing conne floe)
-  (match floe
+  #R conne
+  (match #R floe
+    ;; XXX: when we build the graph of connects an `as` node needs to be
+    ;; a predecessor on all of the "following" nodes.  Otherwise the code
+    ;; could be generated where the use of an `as` bound identifier is before
+    ;; the binding.  A workaround could be to track the uses of these
+    ;; identifiers and add them to the graph, but this would require checking
+    ;; inside Racket (not Qi) code which could be hard.
+    [`(as (,in-info ,_) . ,rands)
+     (cons `(connect (,in-info (#f ,(info-arity in-info) ,rands)))
+           conne)]
     [`(ground ,info) conne]
     [`(tee (,in-info ,out-info) . ,rands)
-     (extract-routing-tee conne in-info out-info rands)]
+     (extract-routing/tee conne in-info out-info rands)]
     [`(thread (,in-info ,out-info) . ,rands)
-     (extract-routing-thread conne in-info out-info rands)]
+     (extract-routing/thread conne in-info out-info rands)]
     [`(relay (,in-info ,out-info) . ,rands)
-     (extract-routing-relay conne in-info out-info rands)]
+     (extract-routing/relay conne in-info out-info rands)]
     [(list* (or '#%fine-template 'gen 'esc) _) (cons floe conne)]))
 
 (define (edge-map conne)
@@ -487,7 +501,7 @@
                     ov))))
 
 (define (order-conne conne)
-  (define-values (dest src) (edge-map conne))
+  (define-values (dest src) #R (edge-map conne))
   (define edge-labels
     (set-union (list->seteq (hash-keys src))
                (list->seteq (hash-keys dest))))
@@ -572,6 +586,9 @@
   (conne:codegen (floe-in floe-arity^)
                  (floe-out floe-arity^)
                  conne^))
+
+#;
+(compile '(relay (esc (1 (>= 0)) list) (esc (1 (>= 0)) list)))
 
 #;
 (compile
