@@ -1,11 +1,11 @@
 #lang debug racket/base
 
-(require graph
-         racket/format
+(require racket/format
          racket/list
          racket/match
          (only-in racket/math nonnegative-integer?)
-         racket/set)
+         racket/set
+         racket/treelist)
 
 (module+ test
   (require rackunit))
@@ -472,41 +472,39 @@
 (define (extract-routing/tee conne in-info out-info floe*)
   (define conne^
     (for/fold ([conne conne]) ([floe (in-list floe*)])
-      (define conne^ (extract-routing conne floe))
-      (cons `(connect (,in-info ,(floe-in floe))) conne^)))
-  (cons `(connect (,(merge-floe-info floe-out floe*) ,out-info))
-        conne^))
+      (define conne^
+        (treelist-add conne `(connect (,in-info ,(floe-in floe)))))
+      (extract-routing conne^ floe)))
+  (treelist-add
+   conne^ `(connect (,(merge-floe-info floe-out floe*) ,out-info))))
 
 (define (extract-routing/relay conne in-info out-info floe*)
-  (list* `(connect (,in-info ,(merge-floe-info floe-in floe*)))
-         `(connect (,(merge-floe-info floe-out floe*) ,out-info))
-         (extract-routing* conne floe*)))
+  (define conne-in
+    (treelist-add conne `(connect (,in-info ,(merge-floe-info floe-in floe*)))))
+  (define conne-body
+    (extract-routing* conne-in floe*))
+  (treelist-add conne-body
+                `(connect (,(merge-floe-info floe-out floe*) ,out-info))))
 
 (define (extract-routing/thread conne in-info out-info floe*)
   (define-values (final-o conne^)
     (for/fold ([last-o in-info] [conne conne]) ([floe (in-list floe*)])
       (define-values (fin fout) (floe-infos floe))
-      (define conne^ (extract-routing conne floe))
       (values fout
-              (cons `(connect (,last-o ,fin)) conne^))))
-  (cons `(connect (,final-o ,out-info)) conne^))
+              (extract-routing (treelist-add conne `(connect (,last-o ,fin)))
+                               floe))))
+  (treelist-add conne^ `(connect (,final-o ,out-info))))
 
 (define (extract-routing* conne floe*)
   (for/fold ([conne conne]) ([floe (in-list floe*)])
     (extract-routing conne floe)))
 
 (define (extract-routing conne floe)
-  #R conne
-  (match #R floe
-    ;; XXX: when we build the graph of connects an `as` node needs to be
-    ;; a predecessor on all of the "following" nodes.  Otherwise the code
-    ;; could be generated where the use of an `as` bound identifier is before
-    ;; the binding.  A workaround could be to track the uses of these
-    ;; identifiers and add them to the graph, but this would require checking
-    ;; inside Racket (not Qi) code which could be hard.
+  (match floe
     [`(as (,in-info (,out-name ,_ ,_)) . ,rands)
-     (cons `(connect (,in-info (,out-name ,(info-arity in-info) ,rands)))
-           conne)]
+     (treelist-add conne
+                   `(connect (,in-info
+                              (,out-name ,(info-arity in-info) ,rands))))]
     [`(ground ,info) conne]
     [`(tee (,in-info ,out-info) . ,rands)
      (extract-routing/tee conne in-info out-info rands)]
@@ -514,37 +512,7 @@
      (extract-routing/thread conne in-info out-info rands)]
     [`(relay (,in-info ,out-info) . ,rands)
      (extract-routing/relay conne in-info out-info rands)]
-    [(list* (or '#%fine-template 'gen 'esc) _) (cons floe conne)]))
-
-(define (edge-map conne)
-  (for/fold ([dest (hasheq)] [src (hasheq)]) ([floe (in-list conne)])
-    (define (update t f v*)
-      (for/fold ([t t]) ([v (in-list v*)])
-        (hash-update t v f (λ () null))))
-    (define-values (iv ov) (floe-vars floe))
-    (values (update dest
-                    (λ (vs) (cons floe vs))
-                    iv)
-            (update src
-                    (λ (vs)
-                      (unless (null? vs)
-                        (error 'edge-map "too many sources"))
-                      floe)
-                    ov))))
-
-(define (order-conne conne)
-  (define-values (dest src) #R (edge-map conne))
-  (define edge-labels
-    (set-union (list->seteq (hash-keys src))
-               (list->seteq (hash-keys dest))))
-  (define edges
-    (for*/list ([e (in-set edge-labels)]
-                [s (in-value (hash-ref src e #f))]
-                #:when s
-                [d (in-list (hash-ref dest e null))])
-      (list s d)))
-  (define g (unweighted-graph/directed edges))
-  (tsort g))
+    [(list* (or '#%fine-template 'gen 'esc) _) (treelist-add conne floe)]))
 
 (define (build-args nfo)
   (match (info-arity nfo)
@@ -584,28 +552,30 @@
        (lambda ,(build-args out) ,tail))]))
 
 (define (conne:codegen/tail conne* tail)
-  (cond
-    [(null? conne*) tail]
-    [else
-     (define tail^
-       (match (car conne*)
-         [`(connect (,in ,out))
-          ;; XXX: need to handle varying connects
-          `(let-values ([,(info-vars out) (values . ,(info-vars in))])
-             ,tail)]
-         [`(#%fine-template (,in ,out) ,expr)
-          (conne:codegen/fine-template in out expr tail)]
-         [`(esc (,in ,out) ,expr)
-          (conne:codegen/esc in out expr tail)]
-         [`(gen (,_ ,out) ,@vals)
-          `(let-values ([,(info-vars out) (values . ,vals)])
-             ,tail)]))
-     (conne:codegen/tail (cdr conne*) tail^)]))
+  (let do-codegen ([i (treelist-length conne*)]
+                   [tail tail])
+    (cond
+      [(zero? i) tail]
+      [else
+       (define tail^
+         (match (treelist-ref conne* (sub1 i))
+           [`(connect (,in ,out))
+            ;; XXX: need to handle varying connects
+            `(let-values ([,(info-vars out) (values . ,(info-vars in))])
+               ,tail)]
+           [`(#%fine-template (,in ,out) ,expr)
+            (conne:codegen/fine-template in out expr tail)]
+           [`(esc (,in ,out) ,expr)
+            (conne:codegen/esc in out expr tail)]
+           [`(gen (,_ ,out) ,@vals)
+            `(let-values ([,(info-vars out) (values . ,vals)])
+               ,tail)]))
+       (do-codegen (sub1 i) tail^)])))
 
 (define (conne:codegen in out conne*)
+  ;; if out is varying arity needs to use `(apply values ...)`
   (define tail
-    (conne:codegen/tail (reverse conne*)
-                        `(values . ,(info-vars out))))
+    (conne:codegen/tail conne* `(values . ,(info-vars out))))
   `(lambda ,(build-args in) ,tail))
 
 (define (compile floe)
@@ -614,11 +584,24 @@
   (define subst #R(solve-constraints cst*))
   (define floe-arity #R(annotate-arity subst floe^))
   (define floe-arity^ #R(add-vars floe-arity))
-  (define conne #R (extract-routing null floe-arity^))
-  (define conne^ #R (order-conne conne))
+  (define conne #R (extract-routing empty-treelist floe-arity^))
   (conne:codegen (floe-in floe-arity^)
                  (floe-out floe-arity^)
-                 conne^))
+                 conne))
+
+
+#;
+(compile '(gen 1 2 3))
+
+#;
+(compile '(thread (relay (as a) (as b) (#%fine-template (+ _ a b)))
+                  (#%fine-template (* a b _))))
+
+#;
+(compile '(relay (as a) (as b) (#%fine-template (+ _ a b))))
+
+#;
+(compile '(thread (gen 2) (ground) (ground) (gen 1)))
 
 #;
 (compile '(relay (esc (1 (>= 0)) list) (esc (1 (>= 0)) list)))
