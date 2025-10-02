@@ -28,8 +28,7 @@
     [(list (? arity?) (? arity?)) #t]
     [_ #f]))
 
-(define (var? v)
-  (and (symbol? v) (not (arity? v))))
+(define var? symbol?)
 
 (define (known-return-arity rator)
   (match rator
@@ -37,32 +36,30 @@
     [(or 'quotient/remainder) 2]
     [_ '(>= 0)]))
 
-(define (merge-arities a b)
+(define (join-arities a b)
   (match* (a b)
-    ;; normally `merge-arities` is called after simple eqv unification has
-    ;; failed so this first clause is only for the general case.
     [(_ (== a)) a]
     [((? nonnegative-integer?) (? nonnegative-integer?)) #f]
     [((list '>= m) (list '>= n)) `(>= ,(max m n))]
-    [((? nonnegative-integer?) _) (merge-arities b a)]
+    [((? nonnegative-integer?) _) (join-arities b a)]
     [((list '>= m) n) (and (>= n m) n)]))
 
 (module+ test
-  (check-equal? (merge-arities 0 0) 0)
-  (check-equal? (merge-arities 3 3) 3)
-  (check-equal? (merge-arities '(>= 0) '(>= 0)) '(>= 0))
-  (check-equal? (merge-arities '(>= 0) 3) 3)
-  (check-equal? (merge-arities 3 '(>= 0)) 3)
-  (check-equal? (merge-arities '(>= 3) 3) 3)
-  (check-equal? (merge-arities 3 '(>= 3)) 3)
-  (check-equal? (merge-arities '(>= 2) 3) 3)
-  (check-equal? (merge-arities 3 '(>= 2)) 3)
-  (check-equal? (merge-arities '(>= 2) '(>= 3)) '(>= 3))
-  (check-equal? (merge-arities '(>= 3) '(>= 2)) '(>= 3))
+  (check-equal? (join-arities 0 0) 0)
+  (check-equal? (join-arities 3 3) 3)
+  (check-equal? (join-arities '(>= 0) '(>= 0)) '(>= 0))
+  (check-equal? (join-arities '(>= 0) 3) 3)
+  (check-equal? (join-arities 3 '(>= 0)) 3)
+  (check-equal? (join-arities '(>= 3) 3) 3)
+  (check-equal? (join-arities 3 '(>= 3)) 3)
+  (check-equal? (join-arities '(>= 2) 3) 3)
+  (check-equal? (join-arities 3 '(>= 2)) 3)
+  (check-equal? (join-arities '(>= 2) '(>= 3)) '(>= 3))
+  (check-equal? (join-arities '(>= 3) '(>= 2)) '(>= 3))
 
-  (check-false (merge-arities 0 3))
-  (check-false (merge-arities '(>= 3) 2))
-  (check-false (merge-arities 2 '(>= 3))))
+  (check-false (join-arities 0 3))
+  (check-false (join-arities '(>= 3) 2))
+  (check-false (join-arities 2 '(>= 3))))
 
 (define (floe-infos floe)
   (match floe
@@ -119,44 +116,48 @@
     [_ `(,rator ,names ,@rands)]))
 
 (define (simplify-constraint cst)
-  (match cst
-    [`(arity-sum ,s) `(has-arity ,s 0)]
-    [`(arity-sum ,s ,v) `(has-arity ,s ,v)]
-    [_ cst]))
+  (let do-simplify ([cst cst])
+    (define next
+      (match cst
+        [`(arity-sum ,s) `(has-arity ,s 0)]
+        [`(arity-sum ,s ,v) `(has-arity ,s ,v)]
+        [`(arity-sum ,s 0 . ,v*) `(arity-sum ,s . ,v*)]
+        [_ cst]))
+    (if (equal? cst next) cst (do-simplify next))))
 
-(define (add-constraint cst* cst)
+(define (constraint-add cst* cst)
   (set-add cst* (simplify-constraint cst)))
 
 (define (add-constraints cst* . more-cst*)
   (for/fold ([cst* cst*]) ([cst (in-list more-cst*)])
-    (add-constraint cst* cst)))
+    (constraint-add cst* cst)))
 
 (define (generate-thread-constraints cst* i o floe*)
   (define-values (final-o cst*^)
     (for/fold ([last-o i] [cst* cst*]) ([floe (in-list floe*)])
       (define-values (fin fout) (floe-lvars floe))
       (values fout
-              (add-constraint cst* `(has-arity ,last-o ,fin)))))
-  (define cst*^^ (add-constraint cst*^ `(has-arity ,final-o ,o)))
+              (constraint-add cst* `(has-arity ,last-o ,fin)))))
+  (define cst*^^ (constraint-add cst*^ `(has-arity ,final-o ,o)))
   (generate-constraints* cst*^^ floe*))
 
 (define (generate-tee-constraints cst* i o floe*)
   (define-values (cst*^ fo*)
     (for/fold ([cst* cst*] [fo* null]) ([floe (in-list floe*)])
       (define-values (fi fo) (floe-lvars floe))
-      (values (add-constraint cst* `(has-arity ,i ,fi))
+      (values (constraint-add cst* `(has-arity ,i ,fi))
               (cons fo fo*))))
-  (generate-constraints* (add-constraint cst*^ `(arity-sum ,o ,@fo*))
+  (generate-constraints* (constraint-add cst*^ `(arity-sum ,o ,@fo*))
                          floe*))
 
 (define (generate-relay-constraints cst* i o floe*)
   (define-values (cst*^ fo*)
     (for/fold ([cst* cst*] [fo* null]) ([floe (in-list floe*)])
       (define-values (fi fo) (floe-lvars floe))
-      (values (add-constraint cst* `(has-arity ,fi 1))
+      (values (constraint-add cst* `(has-arity ,fi 1))
               (cons fo fo*))))
-  (define cst*^^ (add-constraint cst*^ `(has-arity ,i ,(length floe*))))
-  (generate-constraints* (add-constraint cst*^^ `(arity-sum ,o ,@fo*))
+  (define cst*^^ (constraint-add cst*^ `(has-arity ,i ,(length floe*))))
+  (generate-constraints* (constraint-add cst*^^ `(arity-sum ,o ,@fo*))
                          floe*))
 
 (define (generate-fine-template-constraints cst* i o expr)
@@ -181,7 +182,7 @@
   (define (add-decl-constraints cst* var arity)
     (match arity
       [#f cst*]
-      [n  (add-constraint cst* `(has-arity ,var ,n))]))
+      [n  (constraint-add cst* `(has-arity ,var ,n))]))
   (let* ([cst* (add-decl-constraints cst* i ai)]
          [cst* (add-decl-constraints cst* o ao)])
     (match rator
@@ -220,103 +221,138 @@
     (error 'update-subst
            "lhs of update not a var: ~a"
            var))
-  (hash-set subst (canon-var subst var) tgt))
+  (hash-set subst var tgt))
 
 (define (resolve subst v)
   (cond
-    [(arity? v) v]
-    [else
-     (match (hash-ref subst v #f)
-       [#f v]
-       [(? arity? a) a]
-       [v^ (resolve subst v^)])]))
-
-(define (canon-var subst v)
-  (cond
-    [(arity? v) #f]
-    [else
-     (let do-resolve ([v v])
+    [(var? v)
+     (let walk ([v v])
        (match (hash-ref subst v #f)
-         [#f v]
-         [(? arity?) v]
-         [v^ (do-resolve v^)]))]))
+         [(? var? v^) (walk v^)]
+         [a (values v a)]))]
+    [else (values #f v)]))
 
-(define (resolve* subst v*)
-  (for/list ([v (in-list v*)])
-    (resolve subst v)))
+(define (resolve/value subst var)
+  (define-values (var^ val) (resolve subst var))
+  val)
 
-(define (apply-constraint subst defer-cst* cst)
-  (define (defer cst)
-    (add-constraint defer-cst* cst))
-  (match cst
-    [`(has-arity ,u ,v)
-     (define u^ (resolve subst u))
-     (define v^ (resolve subst v))
-     (values (cond
-               [(eqv? u^ v^) subst]
-               [(var? u^) (update-subst subst u^ v^)]
-               [(var? v^) (update-subst subst v^ u^)]
-               [(merge-arities u^ v^)
-                => (λ (new-arity)
-                     (match* ((var? u) (var? v))
-                       [(#f #f)
-                        (warning 'apply-constraint
-                                 "something weird has occurred.\n u: ~a\n v: ~a"
-                                 u v)]
-                       [(#t #f)
-                        (update-subst subst u new-arity)]
-                       [(#f #t)
-                        (update-subst subst v new-arity)]
-                       [(#t #t)
-                        (define cu (canon-var subst u))
-                        (define subst^
-                          (update-subst subst v cu))
-                        (update-subst subst^ cu new-arity)]))]
-               [else
-                (error 'apply-constraint
-                       "cannot apply constraint: (has-arity ~a ~a)"
-                       u^ v^)])
-             defer-cst*)]
-    [`(arity-sum ,s . ,v*)
-     (define s^ (resolve subst s))
-     (define-values (n v^^*)
-       (for/fold ([n 0]
-                  [v* null]
-                  #:result (values n (reverse v*)))
-                 ([v (in-list v*)])
-         (define v^ (resolve subst v))
-         (cond
-           ;; XXX: use `integer?` to allow for "adjust-by" constraints
-           [(nonnegative-integer? v^) (values (+ n v^) v*)]
-           [else
-            ;; not an integer then it is either "partially" solved
-            ;; (arity-at-least) or unsolved.  For either keep the canonical
-            ;; variable
-            (define v^ (canon-var subst v))
-            (values n (cons v^ v*))])))
-     (cond
-       [(null? v^^*)
-        (values subst (defer `(has-arity ,s ,n)))]
-       [(nonnegative-integer? s^)
-        (values subst (defer `(arity-sum ,(- s^ n) ,@v^^*)))]
-       ;; (negative? s^) => somethings gone wrong
-       [(zero? n)
-        (values subst (defer `(arity-sum ,s ,@v^^*)))]
-       [else
-        (values subst (defer `(arity-sum ,s ,n ,@v^^*)))])]))
+(define (apply-constraint/has-arity subst u v)
+  (define (do-error)
+    (error 'apply-constraint/has-arity
+           "cannot unify ~a = ~a" u v))
+  (define (update s t)
+    (update-subst subst s t))
+  (define (join/update v s t)
+    (match (join-arities s t)
+      [#f (do-error)]
+      [a (update v a)]))
+
+  (define-values (u^ uv) (resolve subst u))
+  (define-values (v^ vv) (resolve subst v))
+  (match* (u^ v^ uv vv)
+    [(#f #f  u  v) (if (join-arities u v)
+                       subst
+                       (do-error))]
+
+    [(#f v^  u #f) (update v^ u)]
+    [(u^ #f #f  v) (update u^ v)]
+    [(#f v^  u  v) (join/update v^ v u)]
+    [(u^ #f  u  v) (join/update u^ u v)]
+
+    [(u^ v^ #f #f) (if (eq? u^ v^) subst (update u^ v^))]
+    [(u^ v^ #f  v) (update u^ v^)]
+    [(u^ v^  u #f) (update v^ u^)]
+    [(u^ v^  u  v) (update-subst (join/update v^ v u) u^ v^)]))
 
 (module+ test
-  (check-equal?
-   (call-with-values
-    (λ () (apply-constraint (hasheq 'a 1) (set) '(has-arity a (>= 0))))
-    list)
-   (list (hasheq 'a 1) (set)))
+  (define (canon-subst subst)
+    (for/hasheq ([k (in-hash-keys subst)]
+                 #:do [(define-values (c v) (resolve subst k))]
+                 #:when v)
+      (values k v)))
 
-  (check-equal?
-   (call-with-values
-    (λ () (apply-constraint (hasheq 'a 'b 'b 1) (set) '(has-arity a (>= 0))))
-    list)
-   (list (hasheq 'a 'b 'b 1) (set))))
+  (check-equal? (canon-subst
+                 (apply-constraint/has-arity (hasheq) 'a 'b))
+                (hasheq))
+
+  (check-equal? (canon-subst
+                 (apply-constraint/has-arity (hasheq) 'a 10))
+                (hasheq 'a 10))
+  (check-equal? (canon-subst
+                 (apply-constraint/has-arity (hasheq) 10 'a))
+                (hasheq 'a 10))
+  (check-equal? (canon-subst
+                 (apply-constraint/has-arity (hasheq 'a 10) 'a 10))
+                (hasheq 'a 10))
+  (check-exn exn? (λ () (apply-constraint/has-arity (hasheq 'a 10) 'a 11)))
+
+  (check-equal? (canon-subst
+                 (apply-constraint/has-arity (hasheq 'a 10) 'a '(>= 0)))
+                (hasheq 'a 10))
+
+  (check-equal? (canon-subst
+                 (apply-constraint/has-arity (hasheq 'a '(>= 0)) 'a '(>= 2)))
+                (hasheq 'a '(>= 2)))
+
+  (check-exn exn? (λ () (apply-constraint/has-arity (hasheq 'a '(>= 2)) 'a 1)))
+
+  (check-equal? (canon-subst
+                 (apply-constraint/has-arity (hasheq 'a 'b 'b 1) 'a '(>= 0)))
+                (hasheq 'a 1 'b 1))
+
+  (check-equal? (let* ([subst (hasheq 'a '(>= 0))]
+                       [subst (apply-constraint/has-arity subst 'a 'b)]
+                       [subst (apply-constraint/has-arity subst 'b 0)])
+                  (canon-subst subst))
+                (hasheq 'a 0 'b 0)))
+
+(define (apply-constraint/arity-sum subst s v*)
+  (define-values (s^ sv) (resolve subst s))
+  (define-values (n v^*)
+    (for/fold ([n 0]
+               [v* null]
+               #:result (values n (reverse v*)))
+              ([v (in-list v*)])
+      (define-values (v^ vv) (resolve subst v))
+      (cond
+        ;; XXX: use `integer?` to allow for "adjust-by" constraints
+        [(nonnegative-integer? vv) (values (+ n vv) v*)]
+        [else
+         ;; not an integer then it is either "partially" solved
+         ;; (arity-at-least) or unsolved.  For either keep the canonical
+         ;; variable
+         (values n (cons v^ v*))])))
+  (match* (s^ sv n v^*)
+    [(#f s n '())
+     `(has-arity ,s ,n)]
+    [(#f s n (list v))
+     `(has-arity ,v ,(- s n))]
+    [(#f s n v^*)
+     `(arity-sum ,(- s n) . ,v^*)]
+    [(s^ #f n '())
+     `(has-arity ,s^ ,n)]
+    [(s^ #f n v^*)
+     `(arity-sum ,s^ ,n . ,v^*)]
+    [(s^ _ n '())
+     `(has-arity ,s^ ,n)]
+    [(s^ `(>= ,_) n v^*)
+     `(arity-sum ,s^ ,n . ,v^*)]
+    [(s^ sv n v^*)
+     `(arity-sum ,(- sv n) . ,v^*)]))
+
+(module+ test
+  (check-equal? (apply-constraint/arity-sum (hasheq 'a '(>= 0) 'b 2)
+                                            'a '(b c d))
+                '(arity-sum a 2 c d)))
+
+(define (apply-constraint subst defer-cst* cst)
+  (match cst
+    [`(has-arity ,u ,v)
+     (values (apply-constraint/has-arity subst u v)
+             defer-cst*)]
+    [`(arity-sum ,s . ,v*)
+     (define new-cst (apply-constraint/arity-sum subst s v*))
+     (values subst (constraint-add defer-cst* new-cst))]))
 
 (define (solve-constraints cst*)
   (let do-solve ([subst (hasheq)]
@@ -334,10 +370,6 @@
       [else (do-solve subst^ cst^*)])))
 
 (module+ test
-  (define (canon-subst subst)
-    (for/hasheq ([k (in-hash-keys subst)])
-      (values k (resolve subst k))))
-
   (check-equal?
    (canon-subst
     (solve-constraints
@@ -391,7 +423,7 @@
 (define (annotate-arity subst floe)
   (define-values (fi fo) (floe-lvars floe))
   (define (resolve-arity subst var)
-    (match (resolve subst var)
+    (match (resolve/value subst var)
       [(? arity? a) a]
       [_ (warning 'annotate-arity "no arity computed for ~a" var)
          '(>= 0)]))
