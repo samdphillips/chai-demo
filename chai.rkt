@@ -504,8 +504,8 @@
     ;; the binding.  A workaround could be to track the uses of these
     ;; identifiers and add them to the graph, but this would require checking
     ;; inside Racket (not Qi) code which could be hard.
-    [`(as (,in-info ,_) . ,rands)
-     (cons `(connect (,in-info (#f ,(info-arity in-info) ,rands)))
+    [`(as (,in-info (,out-name ,_ ,_)) . ,rands)
+     (cons `(connect (,in-info (,out-name ,(info-arity in-info) ,rands)))
            conne)]
     [`(ground ,info) conne]
     [`(tee (,in-info ,out-info) . ,rands)
@@ -543,7 +543,8 @@
                 #:when s
                 [d (in-list (hash-ref dest e null))])
       (list s d)))
-  (tsort (unweighted-graph/directed edges)))
+  (define g (unweighted-graph/directed edges))
+  (tsort g))
 
 (define (build-args nfo)
   (match (info-arity nfo)
