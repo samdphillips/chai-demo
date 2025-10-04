@@ -115,7 +115,7 @@
      `(,rator ,names ,@(add-lvars* rands))]
     [_ `(,rator ,names ,@rands)]))
 
-(define (simplify-constraint cst)
+(define (constraint-simplify cst)
   (let do-simplify ([cst cst])
     (define next
       (match cst
@@ -125,48 +125,48 @@
         [_ cst]))
     (if (equal? cst next) cst (do-simplify next))))
 
-(define (constraint-add cst* cst)
-  (set-add cst* (simplify-constraint cst)))
+(define (constraints-add cst* cst)
+  (set-add cst* (constraint-simplify cst)))
 
-(define (add-constraints cst* . more-cst*)
+(define (constraints-add-all cst* . more-cst*)
   (for/fold ([cst* cst*]) ([cst (in-list more-cst*)])
-    (constraint-add cst* cst)))
+    (constraints-add cst* cst)))
 
-(define (generate-thread-constraints cst* i o floe*)
+(define (generate-constraints/thread cst* i o floe*)
   (define-values (final-o cst*^)
     (for/fold ([last-o i] [cst* cst*]) ([floe (in-list floe*)])
       (define-values (fin fout) (floe-lvars floe))
       (values fout
-              (constraint-add cst* `(has-arity ,last-o ,fin)))))
-  (define cst*^^ (constraint-add cst*^ `(has-arity ,final-o ,o)))
+              (constraints-add cst* `(has-arity ,last-o ,fin)))))
+  (define cst*^^ (constraints-add cst*^ `(has-arity ,final-o ,o)))
   (generate-constraints* cst*^^ floe*))
 
-(define (generate-tee-constraints cst* i o floe*)
+(define (generate-constraints/tee cst* i o floe*)
   (define-values (cst*^ fo*)
     (for/fold ([cst* cst*] [fo* null]) ([floe (in-list floe*)])
       (define-values (fi fo) (floe-lvars floe))
-      (values (constraint-add cst* `(has-arity ,i ,fi))
+      (values (constraints-add cst* `(has-arity ,i ,fi))
               (cons fo fo*))))
-  (generate-constraints* (constraint-add cst*^ `(arity-sum ,o ,@fo*))
+  (generate-constraints* (constraints-add cst*^ `(arity-sum ,o ,@fo*))
                          floe*))
 
-(define (generate-relay-constraints cst* i o floe*)
+(define (generate-constraints/relay cst* i o floe*)
   (define-values (cst*^ fo*)
     (for/fold ([cst* cst*] [fo* null]) ([floe (in-list floe*)])
       (define-values (fi fo) (floe-lvars floe))
-      (values (constraint-add cst* `(has-arity ,fi 1))
+      (values (constraints-add cst* `(has-arity ,fi 1))
               (cons fo fo*))))
-  (define cst*^^ (constraint-add cst*^ `(has-arity ,i ,(length floe*))))
-  (generate-constraints* (constraint-add cst*^^ `(arity-sum ,o ,@fo*))
+  (define cst*^^ (constraints-add cst*^ `(has-arity ,i ,(length floe*))))
+  (generate-constraints* (constraints-add cst*^^ `(arity-sum ,o ,@fo*))
                          floe*))
 
-(define (generate-fine-template-constraints cst* i o expr)
+(define (generate-constraints/fine-template cst* i o expr)
   (define (count-placeholders expr)
     (for/fold ([i 0]) ([t expr])
       (if (eq? t '_) (add1 i) i)))
-  (add-constraints cst*
-                   `(has-arity ,i ,(count-placeholders expr))
-                   `(has-arity ,o ,(known-return-arity (car expr)))))
+  (constraints-add-all cst*
+                       `(has-arity ,i ,(count-placeholders expr))
+                       `(has-arity ,o ,(known-return-arity (car expr)))))
 
 (define (generate-constraints* cst* floe*)
   (for/fold ([cst* cst*]) ([floe (in-list floe*)])
@@ -182,38 +182,38 @@
   (define (add-decl-constraints cst* var arity)
     (match arity
       [#f cst*]
-      [n  (constraint-add cst* `(has-arity ,var ,n))]))
+      [n  (constraints-add cst* `(has-arity ,var ,n))]))
   (let* ([cst* (add-decl-constraints cst* i ai)]
          [cst* (add-decl-constraints cst* o ao)])
     (match rator
       ['as
-       (add-constraints cst*
-                        `(has-arity ,i ,(length rands))
-                        `(has-arity ,o 0))]
+       (constraints-add-all cst*
+                            `(has-arity ,i ,(length rands))
+                            `(has-arity ,o 0))]
       ['ground
-       (add-constraints cst*
-                        `(has-arity ,i (>= 0))
-                        `(has-arity ,o 0))]
+       (constraints-add-all cst*
+                            `(has-arity ,i (>= 0))
+                            `(has-arity ,o 0))]
       ['gen
-       (add-constraints cst*
-                        `(has-arity ,i (>= 0))
-                        `(has-arity ,o ,(length rands)))]
+       (constraints-add-all cst*
+                            `(has-arity ,i (>= 0))
+                            `(has-arity ,o ,(length rands)))]
       ['select
-       (add-constraints cst*
-                        `(has-arity ,i (>= ,(sub1 (apply max rands))))
-                        `(has-arity ,o ,(length rands)))]
+       (constraints-add-all cst*
+                            `(has-arity ,i (>= ,(sub1 (apply max rands))))
+                            `(has-arity ,o ,(length rands)))]
       ['esc
-       (add-constraints cst*
-                        `(has-arity ,i (>= 0))
-                        `(has-arity ,o (>= 0)))]
+       (constraints-add-all cst*
+                            `(has-arity ,i (>= 0))
+                            `(has-arity ,o (>= 0)))]
       ['thread
-       (generate-thread-constraints cst* i o rands)]
+       (generate-constraints/thread cst* i o rands)]
       ['tee
-       (generate-tee-constraints cst* i o rands)]
+       (generate-constraints/tee cst* i o rands)]
       ['relay
-       (generate-relay-constraints cst* i o rands)]
+       (generate-constraints/relay cst* i o rands)]
       ['#%fine-template
-       (generate-fine-template-constraints cst* i o (car rands))]
+       (generate-constraints/fine-template cst* i o (car rands))]
       )))
 
 (define (update-subst subst var tgt)
@@ -307,6 +307,7 @@
                 (hasheq 'a 0 'b 0)))
 
 (define (apply-constraint/arity-sum subst s v*)
+  (define (mk cst) (constraints-add (set) cst))
   (define-values (s^ sv) (resolve subst s))
   (define-values (n v^*)
     (for/fold ([n 0]
@@ -316,7 +317,7 @@
       (define-values (v^ vv) (resolve subst v))
       (cond
         ;; XXX: use `integer?` to allow for "adjust-by" constraints
-        [(nonnegative-integer? vv) (values (+ n vv) v*)]
+        [(integer? vv) (values (+ n vv) v*)]
         [else
          ;; not an integer then it is either "partially" solved
          ;; (arity-at-least) or unsolved.  For either keep the canonical
@@ -324,26 +325,49 @@
          (values n (cons v^ v*))])))
   (match* (s^ sv n v^*)
     [(#f s n '())
-     `(has-arity ,s ,n)]
+     (mk `(has-arity ,s ,n))]
     [(#f s n (list v))
-     `(has-arity ,v ,(- s n))]
+     (mk `(has-arity ,v ,(- s n)))]
     [(#f s n v^*)
-     `(arity-sum ,(- s n) . ,v^*)]
+     (mk `(arity-sum ,(- s n) . ,v^*))]
     [(s^ #f n '())
-     `(has-arity ,s^ ,n)]
+     (mk `(has-arity ,s^ ,n))]
     [(s^ #f n v^*)
-     `(arity-sum ,s^ ,n . ,v^*)]
+     (mk `(arity-sum ,s^ ,n . ,v^*))]
     [(s^ _ n '())
-     `(has-arity ,s^ ,n)]
+     (mk `(has-arity ,s^ ,n))]
+    [(s^ `(>= ,sn) n (list v^))
+     (define vnt (- sn n))
+     (define sv^ `(>= ,vnt))
+     (set-union (mk `(arity-sum ,s^ ,n ,v^))
+                (match/values (resolve subst v^)
+                  [(_ #f) (mk `(has-arity ,v^ ,sv^))]
+                  [(_ (and vv `(>= ,vn)))
+                   (cond
+                     [(= vn vnt) (set)]
+                     [(> vn vnt) (error 'apply-constraint/arity-sum
+                                        "cannot unify ~a = ~a" sv^ vv)]
+                     [else (mk `(has-arity ,v^ ,sv))])]))]
     [(s^ `(>= ,_) n v^*)
-     `(arity-sum ,s^ ,n . ,v^*)]
+     (mk `(arity-sum ,s^ ,n . ,v^*))]
     [(s^ sv n v^*)
-     `(arity-sum ,(- sv n) . ,v^*)]))
+     (mk `(arity-sum ,(- sv n) . ,v^*))]))
 
 (module+ test
   (check-equal? (apply-constraint/arity-sum (hasheq 'a '(>= 0) 'b 2)
                                             'a '(b c d))
-                '(arity-sum a 2 c d)))
+                (set '(arity-sum a 2 c d)))
+
+  (check-equal? (apply-constraint/arity-sum
+                 (hasheq 'a '(>= 0) 'b '(>= 1)) 'a '(-1 b))
+                (set '(arity-sum a -1 b)))
+
+  (check-exn exn? (λ () (apply-constraint/arity-sum
+                         (hasheq 'a '(>= 0) 'b '(>= 5))
+                         'a '(-1 b))))
+
+  (check-equal? (apply-constraint/arity-sum (hasheq 'a '(>= 0)) 'a '(-1 b))
+                (set '(has-arity b (>= 1)) '(arity-sum a -1 b))))
 
 (define (apply-constraint subst defer-cst* cst)
   (match cst
@@ -352,7 +376,7 @@
              defer-cst*)]
     [`(arity-sum ,s . ,v*)
      (define new-cst (apply-constraint/arity-sum subst s v*))
-     (values subst (constraint-add defer-cst* new-cst))]))
+     (values subst (set-union defer-cst* new-cst))]))
 
 (define (solve-constraints cst*)
   (let do-solve ([subst (hasheq)]
