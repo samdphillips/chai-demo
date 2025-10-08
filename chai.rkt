@@ -19,6 +19,9 @@
          (list '>= (? nonnegative-integer?))) #t]
     [_ #f]))
 
+(define (arity-exact? v)
+  (and (arity? v) (nonnegative-integer? v)))
+
 (define (check-arity who v)
   (unless (arity? v)
     (error who "expected arity: ~a" v)))
@@ -61,6 +64,16 @@
   (check-false (join-arities '(>= 3) 2))
   (check-false (join-arities 2 '(>= 3))))
 
+#|
+(<flop> <arity-infos> . <floargs>)
+(<connops <arity-infos> . <conargs>)
+
+<arity-infos> := (<info> <info>)
+<info> := (<lvar> <arity>)
+        | ((<var> ...) <arity>)
+        | (((<var> ...) <arity>) ...)
+|#
+
 (define (floe-infos floe)
   (match floe
     [`(,_ (,in ,out) . ,_) (values in out)]))
@@ -75,24 +88,52 @@
 
 (define (info-lvar info)
   (match info
-    [(list* (? symbol? v) _) v]
+    [(list (? symbol? v) _) v]
     [(? symbol? v) v]))
-(define (info-arity info)
+
+(define (info-simple? info)
   (match info
-    [(list* _ a _) a]
+    [(list _ (? arity?)) #t]
     [_ #f]))
-(define (info-vars info)
+
+(define (info-compound? info)
   (match info
-    [(list _ _ v*) v*]
+    ;; just check the first element to determine compound-ness
+    [(list* (list (or (list) (list* (? symbol?) _)) (? arity?)) _) #t]
     [_ #f]))
+
+(define (info-simple-arity info)
+  (match info
+    [(list _ a) a]
+    [_ #f]))
+
+(define (info-effective-arity info)
+  (cond
+    [(info-simple? info) (info-simple-arity info)]
+    [else
+     (for/fold ([s 0]) ([info (in-list info)])
+       (match* (s (info-simple-arity info))
+         [(`(>= ,s) (or `(>= ,i) i)) `(>= ,(+ s i))]
+         [(s `(>= ,i)) `(>= ,(+ s i))]
+         [(s i) (+ s i)]))]))
+
+(define (info-simple-vars info)
+  (match info
+    [(list (list (? symbol? v*) ...) _) v*]
+    [_ (error 'info-simple-vars "info not simple: ~a" info)]))
+
+#;#;
+(define (info-compound-vars info) ...)
+
+(define (info-compound-arity info) ...)
 
 (define ((make-floe-accessor ref) floe)
   (define-values (in out) (floe-infos floe))
   (values (ref in) (ref out)))
 
 (define floe-lvars (make-floe-accessor info-lvar))
-(define floe-arities (make-floe-accessor info-arity))
-(define floe-vars (make-floe-accessor info-vars))
+(define floe-arities (make-floe-accessor info-simple-arity))
+(define floe-vars (make-floe-accessor info-simple-vars))
 
 (define (add-lvars* floe*) (map add-lvars floe*))
 
@@ -477,79 +518,161 @@
   (define-values (ai ao) (floe-arities floe))
   (define ivars (generate-vars fi ai))
   (define ovars (generate-vars fo ao))
-  (define annot `((,fi ,ai ,ivars) (,fo ,ao ,ovars)))
+  (define annot
+    `((,ivars ,ai) (,ovars ,ao)))
   (match-define `(,rator ,_ . ,rands) floe)
   (match rator
     [(or 'thread 'tee 'relay)
      `(,rator ,annot ,@(map add-vars rands))]
     [_ `(,rator ,annot ,@rands)]))
 
+(define (make-connect in-info out-info)
+  (unless (equal? (info-effective-arity in-info)
+                  (info-effective-arity out-info))
+    (error 'make-connect "non-matching arities\n  in: ~a\n  out: ~a"
+           in-info out-info))
+  `(connect (,in-info ,out-info)))
+
 (define (merge-floe-info select-info floe*)
-  (for/fold ([arity 0]
-             [v null]
-             #:result `(#f ,arity ,v))
-            ([floe (in-list floe*)])
-    (define info (select-info floe))
-    (values (+ arity (info-arity info))
-            (append v (info-vars info)))))
+  (define info^
+    (for/list ([floe (in-list floe*)]
+               #:do [(define info (select-info floe))]
+               #:unless (equal? 0 (info-simple-arity info)))
+      info))
+  (match info^
+    [(list i) i]
+    [_ info^]))
 
-(define (extract-routing/tee conne in-info out-info floe*)
-  (define conne^
-    (for/fold ([conne conne]) ([floe (in-list floe*)])
-      (define conne^
-        (treelist-add conne `(connect (,in-info ,(floe-in floe)))))
-      (extract-routing conne^ floe)))
-  (treelist-add
-   conne^ `(connect (,(merge-floe-info floe-out floe*) ,out-info))))
+(define (connect-zero? ai bi)
+  (and (zero? (info-simple-arity ai))
+       (zero? (info-simple-arity bi))))
 
-(define (extract-routing/relay conne in-info out-info floe*)
-  (define conne-in
-    (treelist-add conne `(connect (,in-info ,(merge-floe-info floe-in floe*)))))
-  (define conne-body
-    (extract-routing* conne-in floe*))
-  (treelist-add conne-body
-                `(connect (,(merge-floe-info floe-out floe*) ,out-info))))
+(define (extract-connections/tee tail-conne in-info out-info floe*)
+  (define out-connect (make-connect (merge-floe-info floe-out floe*) out-info))
+  (define (do-extract floe*)
+    (cond
+      [(null? floe*) (cons out-connect tail-conne)]
+      [else
+       (define tail-conne^ (do-extract (cdr floe*)))
+       (define floe (car floe*))
+       (define in-connect (make-connect in-info (floe-in floe)))
+       (cons in-connect (extract-connections tail-conne^ floe))]))
+  (do-extract floe*))
 
-(define (extract-routing/thread conne in-info out-info floe*)
-  (define-values (final-o conne^)
-    (for/fold ([last-o in-info] [conne conne]) ([floe (in-list floe*)])
-      (define-values (fin fout) (floe-infos floe))
-      (values fout
-              (extract-routing (treelist-add conne `(connect (,last-o ,fin)))
-                               floe))))
-  (treelist-add conne^ `(connect (,final-o ,out-info))))
+(define (extract-connections/relay tail-conne in-info out-info floe*)
+  (define out-connect (make-connect (merge-floe-info floe-out floe*) out-info))
+  (define (do-extract floe*)
+    (cond
+      [(null? floe*)
+       (cons out-connect tail-conne)]
+      [else
+       (define tail-conne^ (do-extract (cdr floe*)))
+       (extract-connections tail-conne^ (car floe*))]))
+  (cons (make-connect in-info (merge-floe-info floe-in floe*))
+        (do-extract floe*)))
 
-(define (extract-routing* conne floe*)
-  (for/fold ([conne conne]) ([floe (in-list floe*)])
-    (extract-routing conne floe)))
+(define (extract-connections/thread tail-conne in-info out-info floe*)
+  (define (do-extract floe*)
+    (cond
+      [(null? floe*) (values tail-conne out-info)]
+      [else
+       (define-values (tail-conne^ out-info) (do-extract (cdr floe*)))
+       (define floe (car floe*))
+       (define in-info (floe-out floe))
+       (define tail-conne^^
+         (if (connect-zero? in-info out-info)
+             tail-conne^
+             (cons (make-connect in-info out-info) tail-conne^)))
+       (values (extract-connections tail-conne^^ floe)
+               (floe-in floe))]))
+  (define-values (tail-conne^ out-info^) (do-extract floe*))
+  (cons (make-connect in-info out-info^) tail-conne^))
 
-(define (extract-routing conne floe)
+(define (extract-connections tail-conne floe)
   (match floe
-    [`(as (,in-info (,out-name ,_ ,_)) . ,rands)
-     (treelist-add conne
-                   `(connect (,in-info
-                              (,out-name ,(info-arity in-info) ,rands))))]
-    [`(ground ,info) conne]
+    [`(as (,in-info (,out-name ,_)) . ,rands)
+     (define out-info^ `(,rands ,(info-simple-arity in-info)))
+     (cons (make-connect in-info out-info^)
+           tail-conne)]
+    [`(ground ,info) tail-conne]
     [`(tee (,in-info ,out-info) . ,rands)
-     (extract-routing/tee conne in-info out-info rands)]
+     (extract-connections/tee tail-conne in-info out-info rands)]
     [`(thread (,in-info ,out-info) . ,rands)
-     (extract-routing/thread conne in-info out-info rands)]
+     (extract-connections/thread tail-conne in-info out-info rands)]
     [`(relay (,in-info ,out-info) . ,rands)
-     (extract-routing/relay conne in-info out-info rands)]
-    [(list* (or '#%fine-template 'gen 'esc) _) (treelist-add conne floe)]))
+     (extract-connections/relay tail-conne in-info out-info rands)]
+    [(list* (or '#%fine-template 'gen 'esc) _)
+     (cons floe tail-conne)]))
 
-(define (build-args nfo)
-  (match (info-arity nfo)
-    [(? nonnegative-integer?) (info-vars nfo)]
+(define (pack-info info)
+  (define (do-pack info* v* a)
+    (cond
+      [(null? info*) (list v* a)]
+      [else
+       (define i (car info*))
+       (define arity (info-simple-arity i))
+       (cond
+         [(arity-exact? arity)
+          (do-pack (cdr info*) (append v* (info-simple-vars i)) (+ a arity))]
+         [(zero? a)
+          (match info*
+            [(list i) i]
+            [_ info*])]
+         [else (cons (list v* a) info*)])]))
+  (if (info-compound? info)
+      (do-pack info null 0)
+      info))
+
+(module+ test
+  (check-equal? (pack-info '((a) 1)) '((a) 1))
+  (check-equal? (pack-info '((a) (>= 0))) '((a) (>= 0)))
+  (check-equal? (pack-info '(((a) 1) ((b) 1) ((c) 1)))
+                '((a b c) 3))
+  (check-equal? (pack-info '(((a) 1) ((b) 1) ((c) (>= 0))))
+                '(((a b) 2) ((c) (>= 0))))
+  (check-equal? (pack-info '((() 0) (() 0) ((a b) 2)))
+                '((a b) 2))
+  (check-equal? (pack-info '((() 0) (() 0) ((a) 1) ((b) 1)))
+                '((a b) 2))
+  (check-equal? (pack-info '(((c) (>= 0))))
+                '((c) (>= 0)))
+  (check-equal? (pack-info '((() 0) ((c) (>= 0))))
+                '((c) (>= 0)))
+  (check-equal? (pack-info '(((c) (>= 0)) ((d) (>= 0))))
+                '(((c) (>= 0)) ((d) (>= 0)))))
+
+(define (split-connect in out)
+  (cond
+    [(and (info-simple? in) (info-simple? out)) (make-connect in out)]
+    [(and (info-simple? out) (equal? '(>= 0) (info-simple-arity out)))
+     (make-connect in out)]
+    [(and (info-simple? out) (arity-exact? (info-simple-arity out)))
+     (error 'split-connect "\n  in: ~a\n  out: ~a" in out)]
+    [else
+     (error 'split-connect "\n  in: ~a\n  out: ~a" in out)]))
+
+(define (conne:optimize conne)
+  (for/list ([c (in-list conne)])
+    (match c
+      [`(connect ,(or (list (? info-compound? in) out)
+                      (list in (? info-compound? out))))
+       (define in^ (pack-info in))
+       (define out^ (pack-info out))
+       (split-connect in^ out^)]
+      [_ c])))
+
+(define (build-args info)
+  (match (info-simple-arity info)
+    [(? nonnegative-integer?) (info-simple-vars info)]
     [`(>= ,_)
-     (define v* (reverse (info-vars nfo)))
+     (define v* (reverse (info-simple-vars info)))
      (for/fold ([nv* (car v*)]) ([v (in-list (cdr v*))])
        (cons v nv*))]))
 
 (define (conne:codegen/fine-template in out expr tail)
   (define expr^
     (let replace ([expr expr]
-                  [ivar* (info-vars in)])
+                  [ivar* (info-simple-vars in)])
       (cond
         [(null? expr) null]
         [(eq? '_ (car expr))
@@ -558,48 +681,53 @@
         [else
          (cons (car expr)
                (replace (cdr expr) ivar*))])))
-  `(let-values ([,(info-vars out) ,expr^]) ,tail))
+  ;; XXX: varying return values
+  `(let-values ([,(info-simple-vars out) ,expr^]) ,tail))
 
 (define (conne:codegen/esc in out expr tail)
   (define (do-call c)
-    (match (info-arity in)
+    (match (info-simple-arity in)
       [(? nonnegative-integer?) c]
       [`(>= ,_) `(apply . ,c)]))
   (define call
-    (do-call `(,expr . ,(info-vars in))))
-  (match (info-arity out)
+    (do-call `(,expr . ,(info-simple-vars in))))
+  (match (info-simple-arity out)
     [(? nonnegative-integer?)
-     `(let-values ([,(info-vars out) ,call]) ,tail)]
+     `(let-values ([,(info-simple-vars out) ,call]) ,tail)]
     [`(>= ,_)
      `(call-with-values
        (lambda () ,call)
        (lambda ,(build-args out) ,tail))]))
 
+(define (conne:codegen/connect in out tail)
+  `(let-values ([,(info-simple-vars out)
+                 (values . ,(info-simple-vars in))])
+     ,tail))
+
 (define (conne:codegen/tail conne* tail)
-  (let do-codegen ([i (treelist-length conne*)]
-                   [tail tail])
-    (cond
-      [(zero? i) tail]
-      [else
-       (define tail^
-         (match (treelist-ref conne* (sub1 i))
-           [`(connect (,in ,out))
-            ;; XXX: need to handle varying connects
-            `(let-values ([,(info-vars out) (values . ,(info-vars in))])
-               ,tail)]
-           [`(#%fine-template (,in ,out) ,expr)
-            (conne:codegen/fine-template in out expr tail)]
-           [`(esc (,in ,out) ,expr)
-            (conne:codegen/esc in out expr tail)]
-           [`(gen (,_ ,out) ,@vals)
-            `(let-values ([,(info-vars out) (values . ,vals)])
-               ,tail)]))
-       (do-codegen (sub1 i) tail^)])))
+  (cond
+    [(null? conne*) tail]
+    [else
+     (define tail^ (conne:codegen/tail (cdr conne*) tail))
+     (match (car conne*)
+       [`(connect (,in ,out))
+        (conne:codegen/connect in out tail^)]
+       [`(#%fine-template (,in ,out) ,expr)
+        (conne:codegen/fine-template in out expr tail^)]
+       [`(esc (,in ,out) ,expr)
+        (conne:codegen/esc in out expr tail^)]
+       [`(gen (,_ ,out) ,@vals)
+        `(let-values ([,(info-simple-vars out) (values . ,vals)])
+           ,tail^)])]))
 
 (define (conne:codegen in out conne*)
-  ;; if out is varying arity needs to use `(apply values ...)`
+  (define body
+    (let ([args (info-simple-vars out)])
+      (match (info-simple-arity out)
+        [`(>= ,n) `(apply values . ,args)]
+        [_ `(values . ,args)])))
   (define tail
-    (conne:codegen/tail conne* `(values . ,(info-vars out))))
+    (conne:codegen/tail conne* body))
   `(lambda ,(build-args in) ,tail))
 
 (define (compile floe)
@@ -608,10 +736,11 @@
   (define subst #R(solve-constraints cst*))
   (define floe-arity #R(annotate-arity subst floe^))
   (define floe-arity^ #R(add-vars floe-arity))
-  (define conne #R (extract-routing empty-treelist floe-arity^))
+  (define conne #R (extract-connections null floe-arity^))
+  (define conne^ #R (conne:optimize conne))
   (conne:codegen (floe-in floe-arity^)
                  (floe-out floe-arity^)
-                 conne))
+                 conne^))
 
 
 #;
@@ -625,9 +754,9 @@
 (compile '(relay (as a) (as b) (#%fine-template (+ _ a b))))
 
 #;
-(compile '(thread (gen 2) (ground) (ground) (gen 1)))
+(compile '(thread (gen 1 2 3) (ground) (ground) (gen 1)))
 
-#;
+;#;
 (compile '(relay (esc (1 (>= 0)) list) (esc (1 (>= 0)) list)))
 
 #;
@@ -649,6 +778,9 @@
                (#%fine-template (sub1 _))))
 
 #;
+(compile '(tee (thread) (thread (1 (>= 0))) (thread)))
+
+#;
 (compile '(tee (thread) (thread) (thread)))
 
 #;
@@ -668,6 +800,9 @@
 #;
 (compile '(relay (tee (thread) (thread))
                  (tee (thread) (thread))))
+
+#;
+(compile '(relay (ground) (ground)))
 
 #;
 (compile '(ground))
