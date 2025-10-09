@@ -102,6 +102,11 @@
     [(list* (list (or (list) (list* (? symbol?) _)) (? arity?)) _) #t]
     [_ #f]))
 
+(define (info-arity info)
+  (cond
+    [(info-simple? info) (info-simple-arity info)]
+    [else (for/list ([i (in-list info)]) (info-simple-arity i))]))
+
 (define (info-simple-arity info)
   (match info
     [(list _ a) a]
@@ -241,7 +246,7 @@
                             `(has-arity ,o ,(length rands)))]
       ['select
        (constraints-add-all cst*
-                            `(has-arity ,i (>= ,(sub1 (apply max rands))))
+                            `(has-arity ,i (>= ,(apply max rands)))
                             `(has-arity ,o ,(length rands)))]
       ['esc
        (constraints-add-all cst*
@@ -547,6 +552,14 @@
   (and (zero? (info-simple-arity ai))
        (zero? (info-simple-arity bi))))
 
+(define (extract-connections/select tail-conne in-info out-info n*)
+  (define v*
+    (let ([iv (info-simple-vars in-info)])
+      (for/list ([i (in-list n*)])
+        (list-ref iv (sub1 i)))))
+  (define ia (info-simple-arity out-info))
+  (cons (make-connect (list v* ia) out-info) tail-conne))
+
 (define (extract-connections/tee tail-conne in-info out-info floe*)
   (define out-connect (make-connect (merge-floe-info floe-out floe*) out-info))
   (define (do-extract floe*)
@@ -595,6 +608,8 @@
      (cons (make-connect in-info out-info^)
            tail-conne)]
     [`(ground ,info) tail-conne]
+    [`(select (,in-info ,out-info) . ,rands)
+     (extract-connections/select tail-conne in-info out-info rands)]
     [`(tee (,in-info ,out-info) . ,rands)
      (extract-connections/tee tail-conne in-info out-info rands)]
     [`(thread (,in-info ,out-info) . ,rands)
@@ -700,9 +715,27 @@
        (lambda ,(build-args out) ,tail))]))
 
 (define (conne:codegen/connect in out tail)
-  `(let-values ([,(info-simple-vars out)
-                 (values . ,(info-simple-vars in))])
-     ,tail))
+  (match* {(info-arity in) (info-arity out)}
+    [{(? arity-exact?) (? arity-exact?)}
+     `(let-values ([,(info-simple-vars out)
+                    (values . ,(info-simple-vars in))])
+        ,tail)]
+    [{'(>= 0) '(>= 0)}
+     `(let ([,(car (info-simple-vars out)) ,(car (info-simple-vars in))])
+        ,tail)]
+    [{`(>= ,s) `(>= ,t)}
+     #:when (= s t)
+     `(let-values ([,(info-simple-vars out)
+                    (values . ,(info-simple-vars in))])
+        ,tail)]
+    [{(list '(>= 0) ...) '(>= 0)}
+     (define iv*
+       (for/list ([i (in-list in)])
+         (car (info-simple-vars i))))
+     `(call-with-values
+       (lambda () (apply values (append . ,iv*)))
+       (lambda ,(build-args out) ,tail))]
+    ))
 
 (define (conne:codegen/tail conne* tail)
   (cond
@@ -742,6 +775,12 @@
                  (floe-out floe-arity^)
                  conne^))
 
+#;
+(compile '(select 1 3 5))
+
+#;
+(compile '(tee (thread (select 1 3 5) (#%fine-template (+ _ _ _)))
+               (thread (select 2 4 6) (#%fine-template (+ _ _ _)))))
 
 #;
 (compile '(gen 1 2 3))
@@ -756,8 +795,11 @@
 #;
 (compile '(thread (gen 1 2 3) (ground) (ground) (gen 1)))
 
-;#;
+#;
 (compile '(relay (esc (1 (>= 0)) list) (esc (1 (>= 0)) list)))
+
+#;
+(compile '(relay (esc (1 1) list) (esc (1 1) list)))
 
 #;
 (compile
