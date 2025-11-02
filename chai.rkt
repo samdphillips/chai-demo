@@ -157,7 +157,7 @@
               (list o (cadr arity)))
         (list i o)))
   (match rator
-    [(or 'thread 'tee 'relay)
+    [(or 'thread 'tee 'relay 'sep)
      `(,rator ,names ,@(add-lvars* rands))]
     [_ `(,rator ,names ,@rands)]))
 
@@ -205,6 +205,11 @@
   (define cst*^^ (constraints-add cst*^ `(has-arity ,i ,(length floe*))))
   (generate-constraints* (constraints-add cst*^^ `(arity-sum ,o ,@fo*))
                          floe*))
+
+(define (generate-constraints/sep cst* i o floe)
+  (constraints-add-all (generate-constraints cst* floe)
+                       `(has-arity ,i ,(info-lvar (floe-in floe)))
+                       `(has-arity ,o (>= 0))))
 
 (define (generate-constraints/fine-template cst* i o expr)
   (define (count-placeholders expr)
@@ -258,6 +263,8 @@
        (generate-constraints/tee cst* i o rands)]
       ['relay
        (generate-constraints/relay cst* i o rands)]
+      ['sep
+       (generate-constraints/sep cst* i o (car rands))]
       ['#%fine-template
        (generate-constraints/fine-template cst* i o (car rands))]
       )))
@@ -502,7 +509,7 @@
   (define annot `((,fi ,ai) (,fo ,ao)))
   (match-define `(,rator ,_ . ,rands) floe)
   (match rator
-    [(or 'thread 'tee 'relay)
+    [(or 'thread 'tee 'relay 'sep)
      `(,rator ,annot ,@(annotate-arity* subst rands))]
     [_ `(,rator ,annot ,@rands)]))
 
@@ -527,14 +534,14 @@
     `((,ivars ,ai) (,ovars ,ao)))
   (match-define `(,rator ,_ . ,rands) floe)
   (match rator
-    [(or 'thread 'tee 'relay)
+    [(or 'thread 'tee 'relay 'sep)
      `(,rator ,annot ,@(map add-vars rands))]
     [_ `(,rator ,annot ,@rands)]))
 
 (define (make-connect in-info out-info)
-  (unless (equal? (info-effective-arity in-info)
-                  (info-effective-arity out-info))
-    (error 'make-connect "non-matching arities\n  in: ~a\n  out: ~a"
+  (unless (join-arities (info-effective-arity in-info)
+                        (info-effective-arity out-info))
+    (error 'make-connect "non-joinable arities\n  in: ~a\n  out: ~a"
            in-info out-info))
   `(connect (,in-info ,out-info)))
 
@@ -549,8 +556,9 @@
     [_ info^]))
 
 (define (connect-zero? ai bi)
-  (and (zero? (info-simple-arity ai))
-       (zero? (info-simple-arity bi))))
+  (match* {(info-simple-arity ai) (info-simple-arity bi)}
+    [{0 0} #t]
+    [{_ _} #f]))
 
 (define (extract-connections/select tail-conne in-info out-info n*)
   (define v*
@@ -601,6 +609,11 @@
   (define-values (tail-conne^ out-info^) (do-extract floe*))
   (cons (make-connect in-info out-info^) tail-conne^))
 
+(define (extract-connections/sep tail-conne in out floe)
+  (define conne (extract-connections null floe))
+  (cons `(sep (,in ,out) (,(floe-in floe) ,(floe-out floe)) ,conne)
+        tail-conne))
+
 (define (extract-connections tail-conne floe)
   (match floe
     [`(as (,in-info (,out-name ,_)) . ,rands)
@@ -616,7 +629,9 @@
      (extract-connections/thread tail-conne in-info out-info rands)]
     [`(relay (,in-info ,out-info) . ,rands)
      (extract-connections/relay tail-conne in-info out-info rands)]
-    [(list* (or '#%fine-template 'gen 'esc) _)
+    [`(sep (,in-info ,out-info) ,floe)
+     (extract-connections/sep tail-conne in-info out-info floe)]
+    [(list* (or '#%fine-template 'esc 'gen) _)
      (cons floe tail-conne)]))
 
 (define (pack-info info)
@@ -674,6 +689,8 @@
        (define in^ (pack-info in))
        (define out^ (pack-info out))
        (split-connect in^ out^)]
+      [`(sep ,info ,cinfo ,conne)
+       `(sep ,info ,cinfo ,(conne:optimize conne))]
       [_ c])))
 
 (define (build-args info)
@@ -714,6 +731,17 @@
        (lambda () ,call)
        (lambda ,(build-args out) ,tail))]))
 
+(define (conne:codegen/sep in out cin cout conne* tail)
+  (define conne^* (conne:codegen cin cout conne*))
+  (define zargs `(,conne^* . ,(info-simple-vars in)))
+  (define do-zip
+    (match (info-simple-arity in)
+      [`(>= ,_) `(apply zip-with . ,zargs)]
+      [_ `(zip-with . ,zargs)]))
+  `(call-with-values
+    (lambda () ,do-zip)
+    (lambda ,(build-args out) ,tail)))
+
 (define (conne:codegen/connect in out tail)
   (match* {(info-arity in) (info-arity out)}
     [{(? arity-exact?) (? arity-exact?)}
@@ -734,8 +762,7 @@
          (car (info-simple-vars i))))
      `(call-with-values
        (lambda () (apply values (append . ,iv*)))
-       (lambda ,(build-args out) ,tail))]
-    ))
+       (lambda ,(build-args out) ,tail))]))
 
 (define (conne:codegen/tail conne* tail)
   (cond
@@ -747,6 +774,8 @@
         (conne:codegen/connect in out tail^)]
        [`(#%fine-template (,in ,out) ,expr)
         (conne:codegen/fine-template in out expr tail^)]
+       [`(sep (,in ,out) (,ci ,co) ,expr*)
+        (conne:codegen/sep in out ci co expr* tail^)]
        [`(esc (,in ,out) ,expr)
         (conne:codegen/esc in out expr tail^)]
        [`(gen (,_ ,out) ,@vals)
@@ -766,14 +795,16 @@
 (define (compile floe)
   (define floe^ #R(add-lvars #R floe))
   (define cst* #R(generate-constraints (set) floe^))
-  (define subst #R(solve-constraints cst*))
+  cst*
+  #;((define subst #R(solve-constraints cst*))
   (define floe-arity #R(annotate-arity subst floe^))
+  ;;; ^-- "front-end" / analysis
   (define floe-arity^ #R(add-vars floe-arity))
   (define conne #R (extract-connections null floe-arity^))
   (define conne^ #R (conne:optimize conne))
   (conne:codegen (floe-in floe-arity^)
                  (floe-out floe-arity^)
-                 conne^))
+                 conne^)))
 
 #;
 (compile '(select 1 3 5))
@@ -857,3 +888,26 @@
 
 #;
 (compile '(relay (esc #f) (esc #f)))
+
+#;
+(compile '(sep (esc (lambda (a b) (values a b)))))
+
+#;
+(compile '(sep (#%fine-template (+ _ _))))
+
+#;
+(compile '(thread (sep (#%fine-template (+ _ _)))
+                  (relay (thread) (thread))))
+
+#;
+(compile '(thread (tee (esc (1 1) do-a)
+                       (esc do-b)
+                       (esc do-c)
+                       (esc (1 1) do-d))
+                  (relay (thread) (thread) (thread) (thread))))
+
+#;
+(compile '(thread (tee (esc (1 1) do-a)
+                       (esc do-b)
+                       (esc do-c)
+                       (esc (1 1) do-b))))
