@@ -1,0 +1,37 @@
+#lang datalog
+
+(racket/base).
+
+arity0(a, 1, 1).
+arity0(c, 1, 1).
+arity0(e, 4, 4).
+
+sum(e, e0, e1).
+sum(e0, a, b).
+sum(e1, c, d).
+
+sum(A, B, C) :- sum(A, C, B).
+
+same(V, U) :- same(U, V).
+
+arity(V, V0, V1) :- arity0(V, V0, V1).
+arity(V, N, X) :- same(V, U),
+                  arity(U, N, X).
+
+arity(S, S0, S1) :-
+  sum(S, T, U),
+  arity(T, T0, T1),
+  arity(U, U0, U1),
+  S0 :- +(T0, U0),
+  S1 :- +(T1, U1).
+
+arity(T, T0, T1) :-
+  sum(S, T, U),
+  arity(S, S0, S1),
+  arity(U, U0, U1),
+  T0 :- -(S0, U0),
+  T1 :- -(S1, U1).
+
+sum(A,B,C)?
+
+arity(V, V0, V1)?
